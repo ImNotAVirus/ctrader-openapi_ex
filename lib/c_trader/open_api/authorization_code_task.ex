@@ -7,51 +7,83 @@ defmodule CTrader.OpenApi.AuthorizationCodeTask do
 
   require Logger
 
+  @default_ip "127.0.0.1"
+  @default_port 6969
+  @default_path "/code/"
   @default_timeout :timer.minutes(1)
 
   ## Public API
 
-  def once(opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, @default_timeout)
+  @doc false
+  def supervisor(), do: CTrader.OpenAPI.TaskSupervisor
 
+  def start(opts \\ []), do: do_start(:no_link, opts)
+  def start_link(opts \\ []), do: do_start(:link, opts)
+
+  def await(%Task{} = task) do
+    Task.await(task, :infinity)
+  end
+
+  def once(opts \\ []) do
     __MODULE__
     |> Task.async(:run, [opts])
-    |> Task.await(timeout)
-  catch
-    :exit, {:timeout, {Task, :await, _task}} ->
-      {:error, :timeout}
+    |> Task.await(:infinity)
   end
 
   ## Task callback
 
   def run(opts) do
-    ip = Keyword.get(opts, :ip, "127.0.0.1")
-    port = Keyword.get(opts, :port, 6969)
-    path = Keyword.get(opts, :path, "/code/")
+    start_time = now()
+
+    ip = Keyword.get(opts, :ip, @default_ip)
+    port = Keyword.get(opts, :port, @default_port)
+    path = Keyword.get(opts, :path, @default_path)
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
     {:ok, ip_tuple} = ip |> String.to_charlist() |> :inet.parse_address()
 
     {:ok, socket} = :gen_tcp.listen(port, [:binary, ip: ip_tuple, reuseaddr: true])
-    Logger.debug("AuthorizationCodeServer started on #{ip}:#{port}")
+    Logger.debug("AuthorizationCodeServer started on #{ip}:#{port} (#{path})")
 
-    {:ok, client} = :gen_tcp.accept(socket)
-    Logger.debug("Client connected")
+    with {:ok, client} <- :gen_tcp.accept(socket, timeout) do
+      Logger.debug("Client connected")
 
-    receive do
-      {:tcp, ^client, data} ->
-        data
-        |> parse_data(path)
-        |> tap(&send_response(client, &1))
+      remaining_timeout = max(start_time + timeout - now(), 0)
 
-      {event, ^client} when event in [:tcp_closed, :tcp_error] ->
-        {:error, event}
-    after
-      timeout -> {:error, :timeout}
+      receive do
+        {:tcp, ^client, data} ->
+          data
+          |> parse_data(path)
+          |> tap(&send_response(client, &1))
+
+        {event, ^client} when event in [:tcp_closed, :tcp_error] ->
+          {:error, event}
+      after
+        remaining_timeout -> {:error, :timeout}
+      end
     end
   end
 
   ## Private functions
+
+  defp now(), do: System.monotonic_time(:millisecond)
+
+  defp random_uid() do
+    6 |> :crypto.strong_rand_bytes() |> Base.encode32(case: :lower, padding: false)
+  end
+
+  defp do_start(link_type, opts) do
+    uid = random_uid()
+    opts = Keyword.put(opts, :uid, uid)
+
+    link_fun =
+      case link_type do
+        :link -> :async
+        :no_link -> :async_nolink
+      end
+
+    {:ok, apply(Task.Supervisor, link_fun, [supervisor(), __MODULE__, :run, [opts]])}
+  end
 
   defp parse_data(data, path) do
     # GET /code/?code=dd571a4b990cb0aba1f4f037835b56d553e77da091f727bba0be919ea05d9bddb3ebba5aa36a804d871445 HTTP/1.1
@@ -64,7 +96,6 @@ defmodule CTrader.OpenApi.AuthorizationCodeTask do
   end
 
   defp send_response(client, reply) do
-    # :ok = :gen_tcp.send(socket, data)
     render =
       case reply do
         {:ok, code} -> html_render(false, code)
